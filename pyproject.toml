@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "anine"
+version = "2.4"
+description = "A local AI assistant for your terminal: works with any Ollama model, runs code in a sandbox, asks before it acts."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+anine = "anine:main"
+
+[tool.setuptools]
+py-modules = ["anine"]
