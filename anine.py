@@ -127,6 +127,7 @@ class State:
     text_for = None      # model the mode was decided for
     text_models = []     # models that proved unreliable at native tool calls
     verify = True        # make the model test code it wrote
+    think = None         # None = leave to the model/Ollama default; True/False = pass "think" to reasoning models
     debug = False
     interactive = True   # False while running evals: never stop to ask the user (e.g. to enable /home rw)
 
@@ -158,7 +159,7 @@ def persist_settings():
         c["ctx"] = S.ctx
     c.update({"model": S.model, "home": S.home, "net": S.net, "timeout": S.timeout,
               "theme": S.theme, "rules": S.rules, "toolmode": S.toolmode, "verify": S.verify,
-              "panel": S.panel, "mouse": S.mouse})
+              "panel": S.panel, "mouse": S.mouse, "think": S.think})
     save_conf(c)
     return c
 
@@ -1541,6 +1542,11 @@ def chat(msgs):
                            "num_ctx": S.ctx, "num_predict": max(1024, min(8192, S.ctx // 2))}}
     if not S.text:
         payload["tools"] = TOOLS
+    else:
+        # the model must never write results itself; stopping there saves generating text we would throw away
+        payload["options"]["stop"] = ["<result", "[anine results]"]
+    if S.think is not None and "thinking" in (model_caps(S.model) or []):
+        payload["think"] = S.think
     req = urllib.request.Request(HOST + "/api/chat", data=json.dumps(payload).encode(),
                                  headers={"Content-Type": "application/json"})
     UI.status("thinking")
@@ -1624,12 +1630,20 @@ def chat(msgs):
 
 
 def trim(msgs):
+    """Drop old turns once the history passes the budget. Every trim changes the start of the prompt, which makes
+    Ollama re-process all of it, so cut down to ~65% in one go: trims then happen rarely instead of every turn."""
     limit = S.ctx * 3  # rough chars-per-token budget
-    while sum(len(json.dumps(m)) for m in msgs) > limit:
+    sizes = [len(json.dumps(m)) for m in msgs]
+    total = sum(sizes)
+    if total <= limit:
+        return
+    target = limit * 65 // 100
+    while total > target:
         nxt = next((i for i in range(2, len(msgs)) if msgs[i]["role"] == "user" and not is_internal(msgs[i])), None)
         if nxt is None:
             break
-        del msgs[1:nxt]
+        total -= sum(sizes[1:nxt])
+        del msgs[1:nxt], sizes[1:nxt]
 
 
 ALIASES = {"file_path": "path", "filename": "path", "file": "path", "script": "path", "script_path": "path",
@@ -1719,25 +1733,32 @@ def verify_msg(f):
             "Fix anything that fails.")
 
 
-CAPS = {}
+
+
+SHOWN = {}
+
+
+def model_show(model):
+    """Ollama's /api/show for a model, fetched once per session (failures are not cached); {} if unreachable."""
+    if model not in SHOWN:
+        try:
+            SHOWN[model] = api("/api/show", {"model": model, "name": model}, timeout=5)
+        except Exception:  # noqa: BLE001
+            return {}
+    return SHOWN[model]
 
 
 def model_caps(model):
     """Ollama's capability list for a model (e.g. ['completion','tools']); None if unknown."""
-    if model not in CAPS:
-        try:
-            CAPS[model] = api("/api/show", {"model": model, "name": model}, timeout=5).get("capabilities")
-        except Exception:  # noqa: BLE001
-            CAPS[model] = None
-    return CAPS[model]
+    return model_show(model).get("capabilities")
 
 
 def model_ctx_len(model):
     """The model's trained context window (tokens), or None."""
     try:
-        info = api("/api/show", {"model": model, "name": model}, timeout=5).get("model_info") or {}
+        info = model_show(model).get("model_info") or {}
         return next((int(v) for k, v in info.items() if k.endswith(".context_length")), None)
-    except Exception:  # noqa: BLE001
+    except (ValueError, TypeError):
         return None
 
 
@@ -1805,6 +1826,7 @@ def switch_model(name, save=False):
     S.text_for = None
     auto_ctx()
     pick_mode()
+    warm_up()
     UI.info(f"model: {name}" + ("  (saved as default)" if save else "") + f" · actions: {'text' if S.text else 'native'}")
     w = tools_warning(name)
     if w:
@@ -1969,6 +1991,69 @@ def agent(msgs):
     note(msgs, f"stopped after {MAX_STEPS} steps")
 
 
+# ---------------------------------------------------------------- model loading
+def warm_up():
+    """Load the model into memory in the background so the first prompt doesn't pay the load time. Uses the same
+    num_ctx and keep_alive as chat(), otherwise Ollama would reload the model for the first real request."""
+    def go():
+        try:
+            api("/api/generate", {"model": S.model, "keep_alive": "30m", "options": {"num_ctx": S.ctx}}, timeout=300)
+        except Exception:  # noqa: BLE001
+            pass
+    threading.Thread(target=go, daemon=True).start()
+
+
+def unload_model():
+    try:
+        api("/api/generate", {"model": S.model, "keep_alive": 0}, timeout=30)
+        UI.info(f"unloaded {S.model} from memory (it reloads on the next prompt)")
+    except Exception as e:  # noqa: BLE001
+        UI.warn(f"unload failed: {e}")
+
+
+def loaded_models():
+    """Models Ollama currently holds in memory: [(name, size_bytes, vram_bytes)]; [] if unknown."""
+    try:
+        return [(m.get("name", "?"), int(m.get("size") or 0), int(m.get("size_vram") or 0))
+                for m in api("/api/ps", timeout=5).get("models", [])]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def placement(name, size, vram):
+    """'100% GPU', '37% GPU / 63% CPU', ... for a loaded model."""
+    if not size:
+        return "?"
+    pct = round(100 * vram / size)
+    return "100% GPU" if pct >= 100 else ("100% CPU" if pct <= 0 else f"{pct}% GPU / {100 - pct}% CPU")
+
+
+def bench():
+    """Time a short generation: shows load time, prompt speed and generation speed for the current model."""
+    UI.status("benchmarking")
+    try:
+        r = api("/api/chat", {"model": S.model, "stream": False, "keep_alive": "30m",
+                              "messages": [{"role": "user", "content": "Write a Python function that reverses a string, "
+                                                                       "with a one-line docstring."}],
+                              "options": {"num_ctx": S.ctx, "temperature": 0.1, "num_predict": 128}}, timeout=600)
+    except Exception as e:  # noqa: BLE001
+        UI.warn(f"benchmark failed: {e}")
+        return
+    finally:
+        UI.status(None)
+    ns = lambda k: (r.get(k) or 0) / 1e9  # noqa: E731
+    gen, pre = r.get("eval_count") or 0, r.get("prompt_eval_count") or 0
+    lines = [f"{S.model} @ ctx {S.ctx}", f"  model load:  {ns('load_duration'):.2f}s"]
+    if pre and ns("prompt_eval_duration"):
+        lines.append(f"  prompt:      {pre} tokens, {pre / ns('prompt_eval_duration'):.0f} tok/s")
+    if gen and ns("eval_duration"):
+        lines.append(f"  generation:  {gen} tokens, {gen / ns('eval_duration'):.1f} tok/s")
+    for n, size, vram in loaded_models():
+        if n == S.model or n.split(":")[0] == S.model.split(":")[0]:
+            lines.append(f"  placement:   {placement(n, size, vram)} ({size / 2**30:.1f} GB)")
+    UI.info("\n".join(lines))
+
+
 # ---------------------------------------------------------------- backend checks
 def installed_models():
     return [m["name"] for m in api("/api/tags", timeout=5).get("models", [])]
@@ -2036,6 +2121,12 @@ def doctor():
             print(f"  {DIM}..   model has no native tool support; anine will use text actions (works with most models){RST}")
     else:
         line(False, f"model {S.model} not installed: ollama pull {S.model}")
+    for n, size, vram in loaded_models():
+        where = placement(n, size, vram)
+        slow = "" if "CPU" not in where else "  (part of the model is on the CPU: expect it to be slow; try a smaller model or /ctx 4096)"
+        print(f"  {DIM}..   loaded in Ollama: {n}, {size / 2**30:.1f} GB, {where}{slow}{RST}")
+    print(f"  {DIM}..   speed tip: run the Ollama server with OLLAMA_FLASH_ATTENTION=1 and OLLAMA_KV_CACHE_TYPE=q8_0 "
+          f"to roughly halve context memory{RST}")
     if shutil.which("bwrap"):
         try:
             r = subprocess.run(wrap(["/usr/bin/true"]), capture_output=True, text=True, timeout=10)
@@ -2070,12 +2161,12 @@ THEMES = {
                    g=[(255, 7), (250, 7), (245, 7)]),
 }
 CMDS = ["/help", "/reset", "/clear", "/status", "/model", "/models", "/default", "/config", "/theme",
-        "/panel", "/plan", "/rules", "/home", "/sandbox", "/net", "/auto", "/timeout", "/ctx",
+        "/panel", "/plan", "/rules", "/home", "/sandbox", "/net", "/auto", "/timeout", "/ctx", "/think", "/unload", "/bench",
         "/save", "/load", "/sessions", "/audit", "/undo", "/apply", "/run", "/toolmode", "/verify", "/debug", "/export", "/copy", "/compact", "/tools",
         "/review", "/explain", "/tests", "/harden", "/logs", "/mouse", "/out", "/cd", "/retry", "/exit"]
 CMD_ARGS = {"/home": ["off", "ro", "rw"], "/sandbox": ["on", "off"], "/net": ["on", "off"],
             "/auto": ["on", "off"], "/plan": ["on", "off"], "/theme": list(THEMES),
-            "/config": ["show", "save"], "/toolmode": ["auto", "native", "text"],
+            "/config": ["show", "save"], "/toolmode": ["auto", "native", "text"], "/think": ["auto", "on", "off"],
             "/verify": ["on", "off"], "/debug": ["on", "off"], "/mouse": ["on", "off"], "/copy": ["code", "out", "all"]}
 PROMPTS = {
     "/review": "Do a security review of {t}. Run security_scan, read the flagged code, confirm each finding "
@@ -2107,6 +2198,9 @@ MODEL & CONFIG
   /plan on|off             make the model outline a plan first
   /rules <text>            standing instructions (persist with /config save)
   /timeout N  /ctx N
+  /think auto|on|off       reasoning models: off = no hidden thinking tokens (faster); auto = model default
+  /bench                   time load / prompt / generation speed of the current model
+  /unload                  free the model's memory now
   /toolmode auto|native|text   how the model acts: JSON tool calls, text action blocks, or pick automatically
   /verify on|off           make the model run/test code it wrote (default on)
   /debug on|off            log raw model output to ~/.anine/debug.jsonl
@@ -2127,7 +2221,8 @@ INPUT
 def status_text():
     return (f"model: {S.model} | ctx: {S.ctx} | timeout: {S.timeout}s | auto-run: {S.auto} | plan: {S.plan}\n"
             f"sandbox: {sandbox_on()} | home: {S.home} | net: {S.net} | theme: {S.theme}\n"
-            f"actions: {'text' if S.text else 'native'} (mode {S.toolmode}) | verify: {S.verify} | debug: {S.debug}\n"
+            f"actions: {'text' if S.text else 'native'} (mode {S.toolmode}) | verify: {S.verify} | debug: {S.debug} | "
+            f"think: {'auto' if S.think is None else S.think}\n"
             f"cwd: {S.cwd} | workspace: {WORK}\n"
             f"config: {CONF}")
 
@@ -2317,6 +2412,13 @@ def handle_command(line, msgs):
     elif cmd == "/ctx" and arg.isdigit():
         S.ctx, S.ctx_auto = int(arg), False
         UI.info(f"ctx: {S.ctx}")
+    elif cmd == "/think" and arg in ("on", "off", "auto"):
+        S.think = None if arg == "auto" else onoff
+        UI.info(f"think: {arg}" + ("" if arg == "auto" else " (only sent to models that support thinking)"))
+    elif cmd == "/unload":
+        return ("bg", unload_model)
+    elif cmd == "/bench":
+        return ("bg", bench)
     elif cmd == "/save":
         name = re.sub(r"[^\w.-]", "_", arg or time.strftime("%Y%m%d-%H%M%S"))
         (SESS / f"{name}.json").write_text(json.dumps(msgs))
@@ -3665,6 +3767,7 @@ def main():
     S.mouse = bool(conf.get("mouse", False))
     S.toolmode = a.tools or conf.get("toolmode", "auto")
     S.verify = False if a.no_verify else bool(conf.get("verify", True))
+    S.think = conf.get("think") if isinstance(conf.get("think"), bool) else None
     S.debug = a.debug
     S.text_models = list(conf.get("text_models", []))
     S.plan = a.plan
@@ -3721,6 +3824,8 @@ def main():
         agent(msgs)
         autosave(msgs)
         return
+    if sys.stdin.isatty():
+        warm_up()
     if curses and not a.no_tui and sys.stdin.isatty() and sys.stdout.isatty():
         UI = TuiUI()
         try:
