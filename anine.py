@@ -1105,7 +1105,7 @@ DISPATCH = {"run_python": tool_run_python, "run_shell": tool_run_shell, "list_di
 
 
 # ---------------------------------------------------------------- prompt
-BASE = """You are anine, a helpful AI assistant that runs in the user's terminal on their own computer (@@OS@@). You are good at software work (writing, debugging, reviewing and explaining code), file and text tasks, system administration, data wrangling, research-style questions and everyday questions. Adapt to whatever the user asks; if the request is unclear, ask one short question.
+BASE = """You are anine, a helpful AI assistant that runs in the user's terminal on their own computer (@@OS@@). The language model powering you is @@MODEL@@, run locally through Ollama. If asked what model you are, don't guess who trained it unless you know. You are good at software work (writing, debugging, reviewing and explaining code), file and text tasks, system administration, data wrangling, research-style questions and everyday questions. Adapt to whatever the user asks; if the request is unclear, ask one short question.
 
 You have tools that act on the real machine. Never guess what code does: write it, run it, read the real output, then fix and iterate. Explore with list_dir / glob_files / find_in_files / read_file before changing things. Prefer small edits (edit_file) over rewriting files. Match the language and style of the project you are working in; use Python for scripts unless the user wants something else.
 
@@ -1195,7 +1195,7 @@ def system_prompt():
         env += f" Network is {'on' if S.net else 'off'}."
     else:
         env = "NO sandbox: code runs directly on the host with the user's privileges. Be extra careful."
-    out = (BASE.replace("@@OS@@", os_name()).replace("@@ACT@@", ACT_TEXT if S.text else ACT_NATIVE)
+    out = (BASE.replace("@@OS@@", os_name()).replace("@@MODEL@@", S.model).replace("@@ACT@@", ACT_TEXT if S.text else ACT_NATIVE)
            + f"\n\nEnvironment: {env}\nPaths: tool paths may be relative to cwd; "
            "inside run_python/run_shell use absolute paths. write_file relative paths go to /work.")
     if S.text:
